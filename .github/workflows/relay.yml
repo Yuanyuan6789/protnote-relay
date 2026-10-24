@@ -1,0 +1,121 @@
+name: ProtNote Zenodo relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      file:
+        description: 'Zenodo 文件名 (data.zip / outputs.zip / ablation_models.zip)'
+        required: true
+        default: 'data.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    outputs:
+      length: ${{ steps.probe.outputs.length }}
+      matrix: ${{ steps.mk.outputs.matrix }}
+      parts: ${{ steps.mk.outputs.parts }}
+      tag: ${{ steps.mk.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ZEN: https://zenodo.org/records/13897920/files
+    steps:
+      - name: HEAD 探测（若 Azure 出口同样被 403 则快速失败取证）
+        id: probe
+        run: |
+          set -euo pipefail
+          FILE='${{ github.event.inputs.file }}'
+          case "$FILE" in data.zip|outputs.zip|ablation_models.zip) ;; *) echo "::error::非法文件名 $FILE"; exit 1;; esac
+          URL="$ZEN/${FILE}?download=1"
+          code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 90 "$URL")
+          len=$(curl -sIL --max-time 90 "$URL" | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print $2}')
+          echo "code=$code content-length=$len"
+          if [ "$code" != "200" ] || [ -z "${len:-}" ]; then
+            echo "::error::ZENODO-REJECTS-ACTIONS (code=$code) —— Actions 出口也被 Zenodo 风控，此路不通，请把结论告知 agent"
+            exit 1
+          fi
+          echo "length=$len" >> "$GITHUB_OUTPUT"
+      - name: 建空 Release 并计算分块矩阵
+        id: mk
+        run: |
+          set -euo pipefail
+          FILE='${{ github.event.inputs.file }}'
+          len=${{ steps.probe.outputs.length }}
+          chunk=2000000000
+          n=$(( (len + chunk - 1) / chunk ))
+          echo "总长度=$len 分块数=$n 每块=$chunk 字节"
+          matrix=$(python3 -c "import json;print(json.dumps({'part':[str(i) for i in range($n)]}))")
+          tag="relay-${FILE}-v1"
+          {
+            echo "matrix=$matrix"
+            echo "parts=$n"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          gh release delete "$tag" -y --cleanup-tag -R "$REPO" >/dev/null 2>&1 || true
+          printf 'file=%s\ntotal_length=%s\nchunk=%s\nparts=%s\n' "$FILE" "$len" "$chunk" "$n" > manifest.txt
+          gh release create "$tag" manifest.txt -R "$REPO" --title "$tag" --notes "Zenodo 13897920 ${FILE} 中转：总 ${len} 字节，${n} 块（每块 ≤2GB，末块为余量），逐块 sha256 已附"
+
+  relay:
+    needs: probe
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      ZEN: https://zenodo.org/records/13897920/files
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.probe.outputs.matrix) }}
+    steps:
+      - name: 区间下载第 ${{ matrix.part }} 块
+        run: |
+          set -euo pipefail
+          FILE='${{ github.event.inputs.file }}'
+          len=${{ needs.probe.outputs.length }}
+          chunk=2000000000
+          i=${{ matrix.part }}
+          start=$(( i * chunk ))
+          end=$(( start + chunk - 1 ))
+          if [ "$end" -ge "$len" ]; then end=$(( len - 1 )); fi
+          expected=$(( end - start + 1 ))
+          echo "part=$i range=${start}-${end} expected=${expected} bytes"
+          curl -sfL --retry 4 --retry-delay 5 --max-time 3600 -r "${start}-${end}" -o part.bin "$ZEN/${FILE}?download=1"
+          actual=$(stat -c%s part.bin)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::块 $i 尺寸不符 expected=$expected actual=$actual（服务器忽略 Range？）"
+            exit 1
+          fi
+          name=$(printf 'part_%03d.bin' "$i")
+          mv part.bin "$name"
+          sha256sum "$name" > "${name}.sha256"
+          cat "${name}.sha256"
+      - name: 上传到 Release
+        run: |
+          set -euo pipefail
+          tag=${{ needs.probe.outputs.tag }}
+          gh release upload "$tag" part_*.bin part_*.sha256 -R "$REPO" --clobber
+
+  finish:
+    needs: [probe, relay]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: 核对 Release 资产完整性
+        run: |
+          set -euo pipefail
+          tag=${{ needs.probe.outputs.tag }}
+          n=${{ needs.probe.outputs.parts }}
+          expected=$(( n * 2 + 1 ))
+          have=$(gh release view "$tag" -R "$REPO" --json assets --jq '.assets | length')
+          echo "资产数 have=$have expected=$expected"
+          if [ "$have" -ne "$expected" ]; then
+            echo "::error::资产数不足（个别块上传失败）——在 Actions 页面 Re-run failed jobs 即可续传"
+            exit 1
+          fi
+          gh release view "$tag" -R "$REPO" --json assets --jq '.assets[].name'
+          echo "RELAY-DONE：Release $tag 就绪，回到 agent 执行接收脚本"
